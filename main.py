@@ -12,12 +12,12 @@ Endpoints:
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 import traceback
 
 from motor_cabida import calcular_cabida, DatosTerreno, Normativa
 from motor_estructural import predimensionar, EntradaEstructural
-from motor_financiero import calcular_financiero, EntradaFinanciera
+from motor_financiero import calcular_financiero, EntradaFinanciera, TipologiaDepto
 
 app = FastAPI(
     title="C4 — Motores de Análisis",
@@ -63,15 +63,23 @@ class EstructuralRequest(BaseModel):
     luz_tipica: float = Field(5.0, gt=0, description="Luz libre entre columnas en metros")
 
 
+class TipologiaInput(BaseModel):
+    tipo: str
+    porcentaje: float = Field(..., ge=0, le=100)
+    precio_usd_m2: float = Field(..., gt=0)
+
+
 class FinancieroRequest(BaseModel):
     distrito: str
     area_vendible_m2: float = Field(..., gt=0)
     area_construida_m2: float = Field(..., gt=0)
     num_departamentos: int = Field(..., gt=0)
-    meses_construccion: int = Field(0, ge=0)
     precio_terreno_usd: float = Field(0, ge=0)
-    costo_construccion_usd_m2: float = Field(0, ge=0)
     precio_venta_usd_m2: float = Field(0, ge=0)
+    area_demolicion_m2: float = Field(0, ge=0)
+    porcentaje_capital_propio: float = Field(40.0, ge=0, le=100)
+    velocidad_ventas_mensual: float = Field(0, ge=0)
+    mezcla_tipologias: Optional[List[TipologiaInput]] = None
 
 
 class AnalisisCompletoRequest(BaseModel):
@@ -80,6 +88,10 @@ class AnalisisCompletoRequest(BaseModel):
     luz_tipica: float = Field(5.0, description="Luz libre entre columnas (m)")
     precio_terreno_usd: float = Field(0, ge=0)
     precio_venta_usd_m2: float = Field(0, ge=0)
+    area_demolicion_m2: float = Field(0, ge=0)
+    porcentaje_capital_propio: float = Field(40.0, ge=0, le=100)
+    velocidad_ventas_mensual: float = Field(0, ge=0)
+    mezcla_tipologias: Optional[List[TipologiaInput]] = None
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────
@@ -132,15 +144,19 @@ def endpoint_estructural(req: EstructuralRequest):
 @app.post("/financiero")
 def endpoint_financiero(req: FinancieroRequest):
     try:
+        mezcla = [TipologiaDepto(tipo=t.tipo, porcentaje=t.porcentaje, precio_usd_m2=t.precio_usd_m2)
+                  for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
         entrada = EntradaFinanciera(
             distrito=req.distrito,
             area_vendible_m2=req.area_vendible_m2,
             area_construida_m2=req.area_construida_m2,
             num_departamentos=req.num_departamentos,
-            meses_construccion=req.meses_construccion,
             precio_terreno_usd=req.precio_terreno_usd,
-            costo_construccion_usd_m2=req.costo_construccion_usd_m2,
             precio_venta_usd_m2=req.precio_venta_usd_m2,
+            area_demolicion_m2=req.area_demolicion_m2,
+            porcentaje_capital_propio=req.porcentaje_capital_propio,
+            velocidad_ventas_mensual=req.velocidad_ventas_mensual,
+            mezcla_tipologias=mezcla,
         )
         resultado = calcular_financiero(entrada)
         return _financiero_to_dict(resultado)
@@ -177,6 +193,8 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
         ))
 
         # 3. Financiero (usa datos de cabida)
+        mezcla = [TipologiaDepto(tipo=t.tipo, porcentaje=t.porcentaje, precio_usd_m2=t.precio_usd_m2)
+                  for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
         financiero = calcular_financiero(EntradaFinanciera(
             distrito=req.normativa.distrito,
             area_vendible_m2=cabida.area_vendible_total,
@@ -184,6 +202,10 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             num_departamentos=cabida.num_departamentos,
             precio_terreno_usd=req.precio_terreno_usd,
             precio_venta_usd_m2=req.precio_venta_usd_m2,
+            area_demolicion_m2=req.area_demolicion_m2,
+            porcentaje_capital_propio=req.porcentaje_capital_propio,
+            velocidad_ventas_mensual=req.velocidad_ventas_mensual,
+            mezcla_tipologias=mezcla,
         ))
 
         return {
