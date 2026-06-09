@@ -11,6 +11,7 @@ Endpoints:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import traceback
@@ -18,6 +19,7 @@ import traceback
 from motor_cabida import calcular_cabida, DatosTerreno, Normativa
 from motor_estructural import predimensionar, EntradaEstructural
 from motor_financiero import calcular_financiero, EntradaFinanciera, TipologiaDepto
+from motor_plano import generar_plano_dxf, EntradaPlano
 
 app = FastAPI(
     title="C4 — Motores de Análisis",
@@ -52,9 +54,16 @@ class NormativaInput(BaseModel):
     estacionamientos: float = Field(1.0, ge=0)
 
 
+class TipologiaInput(BaseModel):
+    tipo: str
+    porcentaje: float = Field(..., ge=0, le=100)
+    precio_usd_m2: float = Field(default=0, ge=0)  # 0 = usar promedio del distrito — v2
+
+
 class CabidaRequest(BaseModel):
     terreno: TerrenoInput
     normativa: NormativaInput
+    mezcla_tipologias: Optional[List[TipologiaInput]] = None
 
 
 class EstructuralRequest(BaseModel):
@@ -63,23 +72,54 @@ class EstructuralRequest(BaseModel):
     luz_tipica: float = Field(5.0, gt=0, description="Luz libre entre columnas en metros")
 
 
-class TipologiaInput(BaseModel):
-    tipo: str
-    porcentaje: float = Field(..., ge=0, le=100)
-    precio_usd_m2: float = Field(..., gt=0)
-
-
 class FinancieroRequest(BaseModel):
     distrito: str
     area_vendible_m2: float = Field(..., gt=0)
     area_construida_m2: float = Field(..., gt=0)
     num_departamentos: int = Field(..., gt=0)
+    num_pisos: int = Field(8, ge=1, description="Pisos de vivienda — ajusta el costo por altura")
     precio_terreno_usd: float = Field(0, ge=0)
     precio_venta_usd_m2: float = Field(0, ge=0)
     area_demolicion_m2: float = Field(0, ge=0)
     porcentaje_capital_propio: float = Field(40.0, ge=0, le=100)
     velocidad_ventas_mensual: float = Field(0, ge=0)
     mezcla_tipologias: Optional[List[TipologiaInput]] = None
+
+
+class PlanoRequest(BaseModel):
+    # Terreno
+    frente: float
+    fondo: float
+    area_terreno: float
+    # Normativa
+    retiro_frontal: float = 0.0
+    retiro_lateral: float = 0.0
+    retiro_posterior: float = 0.0
+    distrito: str = ""
+    fuente_normativa: str = ""
+    # Cabida (resultados del motor)
+    planta_libre: float = 0.0
+    pisos_vivienda: int = 0
+    sotanos: int = 0
+    area_construida_bruta: float = 0.0
+    area_vendible_total: float = 0.0
+    num_departamentos: int = 0
+    estacionamientos_requeridos: int = 0
+    cus_utilizado: float = 0.0
+    limitante: str = ""
+    area_min_depto: float = 0.0
+    mezcla_tipologias: Optional[List[TipologiaInput]] = None
+    nombre_proyecto: str = "Proyecto C4"
+    direccion: str = ""
+    # Grúa torre
+    grua_modelo: str = ""
+    grua_radio_m: float = 0.0
+    grua_base_m: float = 0.0
+    # Calles circundantes
+    calle_frontal: str = ""
+    calle_lateral_izq: str = ""
+    calle_lateral_der: str = ""
+    calle_posterior: str = ""
 
 
 class AnalisisCompletoRequest(BaseModel):
@@ -119,7 +159,8 @@ def endpoint_cabida(req: CabidaRequest):
             area_min_depto=req.normativa.area_min_depto,
             estacionamientos=req.normativa.estacionamientos,
         )
-        resultado = calcular_cabida(terreno, normativa)
+        mezcla = [{'tipo': t.tipo, 'porcentaje': t.porcentaje} for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
+        resultado = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla)
         return _cabida_to_dict(resultado)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -151,6 +192,7 @@ def endpoint_financiero(req: FinancieroRequest):
             area_vendible_m2=req.area_vendible_m2,
             area_construida_m2=req.area_construida_m2,
             num_departamentos=req.num_departamentos,
+            num_pisos=req.num_pisos,
             precio_terreno_usd=req.precio_terreno_usd,
             precio_venta_usd_m2=req.precio_venta_usd_m2,
             area_demolicion_m2=req.area_demolicion_m2,
@@ -183,7 +225,8 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             area_min_depto=req.normativa.area_min_depto,
             estacionamientos=req.normativa.estacionamientos,
         )
-        cabida = calcular_cabida(terreno, normativa)
+        mezcla_cabida = [{'tipo': t.tipo, 'porcentaje': t.porcentaje} for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
+        cabida = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla_cabida)
 
         # 2. Estructural (usa datos de cabida)
         estructura = predimensionar(EntradaEstructural(
@@ -200,6 +243,7 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             area_vendible_m2=cabida.area_vendible_total,
             area_construida_m2=cabida.area_construida_bruta,
             num_departamentos=cabida.num_departamentos,
+            num_pisos=cabida.pisos_vivienda,
             precio_terreno_usd=req.precio_terreno_usd,
             precio_venta_usd_m2=req.precio_venta_usd_m2,
             area_demolicion_m2=req.area_demolicion_m2,
@@ -235,6 +279,56 @@ def _financiero_to_dict(r) -> dict:
     return d
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@app.post("/plano")
+def endpoint_plano(req: PlanoRequest):
+    """Genera un plano DXF de ubicación y cuadro de áreas."""
+    try:
+        mezcla_plano = (
+            [{"tipo": t.tipo, "porcentaje": t.porcentaje} for t in req.mezcla_tipologias]
+            if req.mezcla_tipologias else []
+        )
+        entrada = EntradaPlano(
+            frente=req.frente,
+            fondo=req.fondo,
+            area_terreno=req.area_terreno,
+            retiro_frontal=req.retiro_frontal,
+            retiro_lateral=req.retiro_lateral,
+            retiro_posterior=req.retiro_posterior,
+            distrito=req.distrito,
+            fuente_normativa=req.fuente_normativa,
+            planta_libre=req.planta_libre,
+            pisos_vivienda=req.pisos_vivienda,
+            sotanos=req.sotanos,
+            area_construida_bruta=req.area_construida_bruta,
+            area_vendible_total=req.area_vendible_total,
+            num_departamentos=req.num_departamentos,
+            estacionamientos_requeridos=req.estacionamientos_requeridos,
+            cus_utilizado=req.cus_utilizado,
+            limitante=req.limitante,
+            area_min_depto=req.area_min_depto,
+            mezcla_tipologias=mezcla_plano,
+            nombre_proyecto=req.nombre_proyecto,
+            direccion=req.direccion,
+            grua_modelo=req.grua_modelo,
+            grua_radio_m=req.grua_radio_m,
+            grua_base_m=req.grua_base_m,
+            calle_frontal=req.calle_frontal,
+            calle_lateral_izq=req.calle_lateral_izq,
+            calle_lateral_der=req.calle_lateral_der,
+            calle_posterior=req.calle_posterior,
+        )
+        dxf_bytes = generar_plano_dxf(entrada)
+        nombre_archivo = f"plano_c4_{req.distrito.lower().replace(' ', '_')}.dxf"
+        return Response(
+            content=dxf_bytes,
+            media_type="application/dxf",
+            headers={"Content-Disposition": f'attachment; filename="{nombre_archivo}"'},
+        )
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"Error generando plano: {traceback.format_exc()}")
+
+
+# NOTA: arrancar SIEMPRE con uvicorn desde la terminal:
+#     python -m uvicorn main:app --port 8000 --reload
+# No usar `python main.py`: con reload=True deja un proceso huérfano
+# escuchando en 0.0.0.0:8000 que intercepta las peticiones con código viejo.

@@ -23,6 +23,14 @@ ALTURA_PISO_ML = 3.0            # metros por piso (piso a piso)
 ALTURA_SOTANO_ML = 3.5          # mayor por instalaciones
 MAX_SOTANOS = 2                 # máximo razonable de sótanos
 
+# Área típica neta por tipología (m²) — usado para calcular cantidad real de deptos
+AREA_POR_TIPO: dict[str, float] = {
+    'studio': 35.0, 'monoambiente': 35.0, 'estudio': 35.0,
+    '1dorm': 50.0,  '1_dorm': 50.0,
+    '2dorm': 70.0,  '2_dorm': 70.0,
+    '3dorm': 100.0, '3_dorm': 100.0,
+}
+
 
 # ─── Tipos de entrada ──────────────────────────────────────────────────────
 @dataclass
@@ -88,7 +96,23 @@ class ResultadoCabida:
 
 
 # ─── Motor principal ───────────────────────────────────────────────────────
-def calcular_cabida(terreno: DatosTerreno, normativa: Normativa) -> ResultadoCabida:
+def _area_efectiva_depto(mezcla: list, area_min: float) -> float:
+    """Área promedio ponderada según mezcla de tipologías. Nunca baja del mínimo normativo."""
+    if not mezcla:
+        return area_min
+    total_pct = sum(float(t.get('porcentaje', 0)) for t in mezcla)
+    if total_pct <= 0:
+        return area_min
+    def _norm(s: str) -> str:
+        return s.lower().replace('-', '').replace(' ', '').replace('_', '')
+    avg = sum(
+        AREA_POR_TIPO.get(_norm(t.get('tipo', '')), 70.0) * float(t.get('porcentaje', 0))
+        for t in mezcla
+    ) / total_pct
+    return max(area_min, round(avg, 1))
+
+
+def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologias: list = None) -> ResultadoCabida:
     # 1. Dimensiones del terreno
     frente, fondo = _inferir_dimensiones(terreno)
 
@@ -118,8 +142,9 @@ def calcular_cabida(terreno: DatosTerreno, normativa: Normativa) -> ResultadoCab
     area_vendible_total = area_construida_bruta * FACTOR_VENDIBLE
     area_no_vendible = area_construida_bruta - area_vendible_total
 
-    # 6. Departamentos
-    num_departamentos = math.floor(area_vendible_total / normativa.area_min_depto)
+    # 6. Departamentos — usa área efectiva de la mezcla si el usuario la definió
+    area_depto_efectiva = _area_efectiva_depto(mezcla_tipologias or [], normativa.area_min_depto)
+    num_departamentos = math.floor(area_vendible_total / area_depto_efectiva)
 
     # 7. Estacionamientos
     estacionamientos_requeridos = math.ceil(num_departamentos * normativa.estacionamientos)
@@ -144,7 +169,7 @@ def calcular_cabida(terreno: DatosTerreno, normativa: Normativa) -> ResultadoCab
         sotanos=sotanos,
         estac_en_pb=estac_en_pb,
         estac_en_sotano=estac_en_sotano,
-        area_min_depto=normativa.area_min_depto,
+        area_min_depto=area_depto_efectiva,
         estac_por_sotano=estac_por_sotano,
     )
 

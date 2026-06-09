@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+# Planos DXF de prueba (no versionar)
+*.dxf

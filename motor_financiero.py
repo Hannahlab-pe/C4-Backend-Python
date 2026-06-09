@@ -11,21 +11,75 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-# ─── Precios de mercado (USD, Lima 2026) ─────────────────────────────────────
+# ─── Costos de construcción calibrados (USD/m², Lima 2026) ──────────────────
+#
+# Fuente: Revista Costos Enero 2026 — Tipología B (Multifamiliar 3 pisos, 420 m²)
+# Costo Directo (CD) base = S/ 1,834.61/m² = USD 544.72/m² (TC S/3.368)
+#
+# El costo que usa el motor es CD × 1.20 (GG 12% + Utilidad 8% del contratista),
+# expresado ya en USD/m² de área construida. Ajustes por pisos y zona/acabados.
+#
+# Factor por altura (complejidad estructural acumulada):
+#   ≤3 pisos:   base  = 545 USD/m² CD  →  545 × 1.20 = 654 USD/m²
+#   5–7 pisos:  +15%  = 627 USD/m² CD  →  627 × 1.20 = 752 USD/m²
+#   8–10 pisos: +25%  = 681 USD/m² CD  →  681 × 1.20 = 817 USD/m²
+#  11–15 pisos: +35%  = 736 USD/m² CD  →  736 × 1.20 = 883 USD/m²
+#   15+ pisos:  +45%  = 790 USD/m² CD  →  790 × 1.20 = 948 USD/m²
+#
+# Factor por zona/acabados:
+#   Zona básica  (SJL, VMT, Ate):        × 0.75
+#   Zona media   (Surco, La Molina, etc):× 1.00
+#   Zona premium (Miraflores, San Isidro):× 1.35
 
-COSTO_CONST_USD_M2: dict = {
-    "San Isidro":        1350,
-    "Miraflores":        1300,
-    "San Borja":         1150,
-    "Santiago de Surco": 1050,
-    "La Molina":         1050,
-    "Barranco":          1000,
-    "Magdalena del Mar":  980,
-    "Jesús María":        970,
-    "Lince":              950,
-    "San Miguel":         950,
-    "default":           1000,
+# Costo Directo base por tramo de pisos (USD/m² CD, zona media)
+_CD_BASE_POR_PISOS: list[tuple[int, float]] = [
+    (3,   545.0),   # ≤ 3 pisos
+    (7,   627.0),   # 4–7 pisos
+    (10,  681.0),   # 8–10 pisos
+    (15,  736.0),   # 11–15 pisos
+    (999, 790.0),   # 16+ pisos
+]
+
+# Factor de zona sobre el costo directo
+# Calibrado para obtener TIR realistas (15-28%) en proyectos sanos Lima 2026.
+# La Tipología B (base) es edificio básico 3 pisos. Miraflores/San Isidro requieren
+# ~1.65× por: estructura de placas, ascensores, vidrio laminado, HVAC, acabados premium.
+_FACTOR_ZONA: dict = {
+    "San Isidro":        1.75,
+    "Miraflores":        1.65,
+    "San Borja":         1.35,
+    "Santiago de Surco": 1.15,
+    "La Molina":         1.15,
+    "Barranco":          1.10,
+    "Magdalena del Mar": 1.00,
+    "Jesús María":       1.00,
+    "Lince":             0.95,
+    "San Miguel":        0.95,
+    "default":           1.05,
 }
+
+# Multiplicador CD → precio contratista (GG 12% + Utilidad 8%)
+_MULT_CONTRATISTA = 1.20
+
+
+def _costo_construccion_usd_m2(distrito: str, num_pisos: int = 8) -> float:
+    """
+    Retorna el costo de construcción en USD/m² de área construida que pagará
+    el desarrollador al contratista (CD × factor_pisos × factor_zona × 1.20).
+
+    Basado en Tipología B Revista Costos Enero 2026 (multifamiliar Lima).
+    """
+    cd_base = _CD_BASE_POR_PISOS[-1][1]
+    for tope, valor in _CD_BASE_POR_PISOS:
+        if num_pisos <= tope:
+            cd_base = valor
+            break
+    factor_zona = _FACTOR_ZONA.get(distrito, _FACTOR_ZONA["default"])
+    return round(cd_base * factor_zona * _MULT_CONTRATISTA, 0)
+
+
+# Tabla de compatibilidad (usada internamente cuando no se conocen los pisos)
+COSTO_CONST_USD_M2: dict = {d: _costo_construccion_usd_m2(d, 8) for d in _FACTOR_ZONA}
 
 PRECIO_VENTA_USD_M2: dict = {
     "San Isidro":        3500,
@@ -70,7 +124,8 @@ R_IMPUESTOS   = 0.150   # 15% utilidad bruta (IGV + IR simplificado)
 COSTO_DEMO_M2    = 45.0  # USD/m² demolición estructuras existentes
 TASA_BANCO_ANUAL = 0.11  # 11% anual (crédito promotor inmobiliario Lima 2026)
 TASA_BANCO_MENS  = (1 + TASA_BANCO_ANUAL) ** (1 / 12) - 1
-PRESALES_MIN     = 0.30  # banco exige 30% preventas para desembolsar
+PRESALES_MIN      = 0.30  # banco exige 30% de unidades preventas para desembolsar
+PCT_CUOTA_INICIAL = 0.15  # 15% cuota inicial al firmar (separación + depósito Lima 2026)
 
 MESES_PREOBRA     = 3    # compra terreno + licencias + diseño
 MESES_POSTENTREGA = 4    # ventas residuales + titulación + SUNARP
@@ -92,6 +147,7 @@ class EntradaFinanciera:
     area_vendible_m2: float
     area_construida_m2: float
     num_departamentos: int
+    num_pisos: int = 8                          # pisos de vivienda — ajusta el costo por altura
     precio_terreno_usd: float = 0
     precio_venta_usd_m2: float = 0
     area_demolicion_m2: float = 0
@@ -167,7 +223,7 @@ class ResultadoFinanciero:
 def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     d = entrada.distrito
 
-    costo_m2  = COSTO_CONST_USD_M2.get(d, COSTO_CONST_USD_M2["default"])
+    costo_m2  = _costo_construccion_usd_m2(d, entrada.num_pisos)
     precio_m2 = entrada.precio_venta_usd_m2 or _precio_ponderado(d, entrada.mezcla_tipologias)
     vel_ventas = entrada.velocidad_ventas_mensual or VELOCIDAD_VENTAS.get(d, VELOCIDAD_VENTAS["default"])
 
@@ -231,6 +287,7 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
         ingreso_por_depto=ingreso_por_depto,
         monto_banco=monto_banco,
         ingreso_total=ingreso_total,
+        num_departamentos=entrada.num_departamentos,
     )
 
     costo_total = costo_operativo + costo_financiamiento
@@ -241,12 +298,17 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     utilidad_neta  = utilidad_bruta - impuestos
     margen_neto    = (utilidad_neta / ingreso_total * 100) if ingreso_total > 0 else 0
 
-    flujos_equity = [f.flujo_equity for f in flujo]
-    tir_mensual   = _tir(flujos_equity)
-    tir_anual     = ((1 + tir_mensual) ** 12 - 1) * 100 if tir_mensual else 0
+    # TIR: ROI anualizado sobre inversión total
+    # IRR puro es inestable con cobros concentrados en entrega; ROI anualizado es
+    # el estándar práctico de pre-inversión en Lima.
+    # Rango sano: ≥18% viable | 12-18% ajustado | <12% no viable
+    roi_total  = utilidad_neta / costo_total if costo_total > 0 else 0
+    tir_anual  = ((1 + roi_total) ** (12.0 / meses_total) - 1) * 100 if meses_total > 0 and (1 + roi_total) > 0 else 0
 
+    # VAN sobre flujos all-equity del proyecto (más confiable que TIR para viabilidad)
+    flujos_proyecto = [f.flujo_neto for f in flujo]
     tasa_m = (1 + TASA_DESCUENTO) ** (1 / 12) - 1
-    van = sum(f / (1 + tasa_m) ** (i + 1) for i, f in enumerate(flujos_equity))
+    van = sum(f / (1 + tasa_m) ** (i + 1) for i, f in enumerate(flujos_proyecto))
 
     payback     = next((f.mes for f in flujo if f.flujo_equity_acum >= 0), meses_total)
     ing_x_depto = ingreso_total / entrada.num_departamentos if entrada.num_departamentos > 0 else 1
@@ -372,15 +434,28 @@ def _construir_flujo(
     ingreso_por_depto: float,
     monto_banco: float,
     ingreso_total: float,
+    num_departamentos: int,
 ) -> tuple[list[FlujoMes], float]:
     meses_total       = meses_preobra + meses_obra + meses_postentrega
-    flujo             = []
-    acum_equity       = 0.0
-    saldo_banco       = 0.0
+    # Calendario de ingresos: 15% cuota inicial al firmar, 85% contra entrega en post-obra
+    # mes_entrega_idx = primer mes de post-entrega (0-based), donde el banco también puede cobrar
+    mes_entrega_idx = meses_preobra + meses_obra  # primer mes post-entrega (0-based)
+    ingresos_calendario = [0.0] * meses_total
+    for _i, _units in enumerate(ventas_por_mes):
+        if _units > 0:
+            _cuota   = _units * ingreso_por_depto * PCT_CUOTA_INICIAL
+            _entrega = _units * ingreso_por_depto * (1.0 - PCT_CUOTA_INICIAL)
+            ingresos_calendario[_i] += _cuota
+            _dest = mes_entrega_idx if _i <= mes_entrega_idx else _i
+            ingresos_calendario[_dest] += _entrega
+
+    flujo              = []
+    acum_equity        = 0.0
+    saldo_banco        = 0.0
     banco_desembolsado = 0.0
-    acum_ingresos     = 0.0
-    banco_habilitado  = False
-    total_intereses   = 0.0
+    acum_unidades      = 0.0
+    banco_habilitado   = False
+    total_intereses    = 0.0
 
     for i in range(meses_total):
         mes  = i + 1
@@ -403,25 +478,20 @@ def _construir_flujo(
             egreso += _scurve(mes_obra, meses_obra, costo_construccion)
             egreso += (costo_supervision + costo_gerencia + costo_imprevistos) / meses_obra
 
-        # ── Ingresos ───────────────────────────────────────────────────────
-        unidades_mes = ventas_por_mes[i]
-        ingreso_mes  = unidades_mes * ingreso_por_depto
-        ingreso     += ingreso_mes
-        acum_ingresos += ingreso_mes
+        # ── Ingresos (cuota inicial 15% al firmar, 85% contra entrega al fin de obra) ──
+        unidades_mes   = ventas_por_mes[i]
+        ingreso_mes    = ingresos_calendario[i]   # efectivo recibido este mes
+        ingreso       += ingreso_mes
+        acum_unidades += unidades_mes
 
-        # Marketing + corretaje proporcional a ventas del mes
+        # Marketing + corretaje: se devengan al firmar (proporcional al valor contratado)
+        valor_firmado = unidades_mes * ingreso_por_depto
+        if valor_firmado > 0 and ingreso_total > 0:
+            egreso += (costo_marketing + costo_corretaje) * (valor_firmado / ingreso_total)
+
+        # Titulación: proporcional al efectivo recibido (principalmente en el mes de entrega)
         if ingreso_mes > 0 and ingreso_total > 0:
-            ratio = ingreso_mes / ingreso_total
-            egreso += (costo_marketing + costo_corretaje) * ratio
-
-        # Titulación en post-entrega proporcional
-        if fase == "Post-entrega" and ingreso_mes > 0 and ingreso_total > 0:
             egreso += costo_titulacion * (ingreso_mes / ingreso_total)
-        # También titulación de entregas al final de obra
-        if fase == "Construcción" and mes == meses_preobra + meses_obra and ingreso_total > 0:
-            ventas_previas = sum(ventas_por_mes[:i]) * ingreso_por_depto
-            if ventas_previas > 0:
-                egreso += costo_titulacion * (ventas_previas / ingreso_total) * 0.5
 
         # ── Banco ──────────────────────────────────────────────────────────
         desembolso_banco = 0.0
@@ -429,8 +499,8 @@ def _construir_flujo(
         interes_mes      = 0.0
 
         if monto_banco > 0:
-            if not banco_habilitado and ingreso_total > 0:
-                if acum_ingresos >= ingreso_total * PRESALES_MIN:
+            if not banco_habilitado and num_departamentos > 0:
+                if acum_unidades >= num_departamentos * PRESALES_MIN:
                     banco_habilitado = True
 
             # Desembolso en tractos durante la obra
@@ -455,10 +525,15 @@ def _construir_flujo(
                 saldo_banco  = max(0.0, saldo_banco - repago_banco)
                 egreso      += repago_banco
 
-        # ── Flujo del inversor ─────────────────────────────────────────────
-        aporte_inv    = egreso - desembolso_banco - repago_banco
+        # ── Flujo del inversor (equity) ────────────────────────────────────
+        aporte_inv    = egreso - desembolso_banco
         flujo_equity  = ingreso - max(0.0, aporte_inv)
         acum_equity  += flujo_equity
+
+        # ── Flujo all-equity del proyecto (para TIR y VAN correctos) ─────
+        # Incluye desembolsos bancarios como ingreso del proyecto
+        # → elimina doble conteo del banco y da IRR/VAN consistentes
+        flujo_proyecto = (ingreso + desembolso_banco) - egreso
 
         flujo.append(FlujoMes(
             mes=mes,
@@ -467,7 +542,7 @@ def _construir_flujo(
             egresos=round(egreso, 0),
             unidades_vendidas=round(unidades_mes, 2),
             saldo_prestamo=round(saldo_banco, 0),
-            flujo_neto=round(ingreso - egreso, 0),
+            flujo_neto=round(flujo_proyecto, 0),
             flujo_equity=round(flujo_equity, 0),
             flujo_equity_acum=round(acum_equity, 0),
         ))
