@@ -225,6 +225,9 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
 
     costo_m2  = _costo_construccion_usd_m2(d, entrada.num_pisos)
     precio_m2 = entrada.precio_venta_usd_m2 or _precio_ponderado(d, entrada.mezcla_tipologias)
+    # Guarda final: nunca dejar precio en 0 (colapsa ingresos y TIR)
+    if not precio_m2 or precio_m2 <= 0:
+        precio_m2 = PRECIO_VENTA_USD_M2.get(d, PRECIO_VENTA_USD_M2["default"])
     vel_ventas = entrada.velocidad_ventas_mensual or VELOCIDAD_VENTAS.get(d, VELOCIDAD_VENTAS["default"])
 
     meses_obra  = _estimar_meses_obra(entrada.area_construida_m2)
@@ -359,7 +362,9 @@ def _precio_ponderado(distrito: str, mezcla: Optional[list[TipologiaDepto]]) -> 
     total_pct = sum(t.porcentaje for t in mezcla)
     if total_pct <= 0:
         return base
-    return sum(t.precio_usd_m2 * (t.porcentaje / total_pct) for t in mezcla)
+    # Si un tipo no trae precio (0), usar el promedio del distrito para ese tipo
+    ponderado = sum((t.precio_usd_m2 or base) * (t.porcentaje / total_pct) for t in mezcla)
+    return ponderado or base
 
 
 def _estimar_meses_obra(area_construida: float) -> int:
