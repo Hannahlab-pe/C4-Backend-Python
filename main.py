@@ -432,6 +432,122 @@ def endpoint_leer_plano(req: LeerPlanoRequest):
             except Exception: pass
 
 
+class UbicarGruaRequest(BaseModel):
+    dxf_base64: str
+    modelo: str = "Grúa torre"
+    radio_m: float = 50
+    base_m: float = 3.2
+    frente_m: float = 12
+    fondo_m: float = 25
+    esquina: str = "posterior_izq"  # posterior_izq | posterior_der | frontal_izq | frontal_der
+
+
+@app.post("/ubicar-grua")
+def endpoint_ubicar_grua(req: UbicarGruaRequest):
+    """Dibuja la grúa (base + radio de pluma + rótulo) sobre el DXF recibido y lo devuelve modificado."""
+    import base64 as _b64, tempfile, os as _os, ezdxf
+    from ezdxf import bbox
+    tin = tout = None
+    try:
+        raw = _b64.b64decode(req.dxf_base64)
+        fd, tin = tempfile.mkstemp(suffix=".dxf")
+        with _os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        try:
+            doc = ezdxf.readfile(tin)
+        except Exception:
+            from ezdxf import recover
+            doc, _ = recover.readfile(tin)
+        msp = doc.modelspace()
+
+        # Bounding box total del dibujo
+        ext = bbox.extents(msp)
+        if not ext.has_data:
+            raise HTTPException(status_code=400, detail="No pude calcular las dimensiones del plano.")
+        Sx0, Sy0, Sx1, Sy1 = ext.extmin.x, ext.extmin.y, ext.extmax.x, ext.extmax.y
+        sheet_area = max((Sx1 - Sx0) * (Sy1 - Sy0), 1e-9)
+
+        # Detectar contorno (footprint): polilínea cerrada de mayor área pero < 60% de la lámina (evita el marco)
+        polys = []
+        for e in msp.query("LWPOLYLINE"):
+            try:
+                if not e.closed:
+                    continue
+                pts = [(p[0], p[1]) for p in e.get_points()]
+                if len(pts) < 4:
+                    continue
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                w, h = max(xs) - min(xs), max(ys) - min(ys)
+                if w <= 0 or h <= 0:
+                    continue
+                polys.append((w * h, min(xs), min(ys), max(xs), max(ys), w, h))
+            except Exception:
+                pass
+        cand = sorted([p for p in polys if p[0] < 0.6 * sheet_area], key=lambda p: -p[0])
+        if cand:
+            _, fx0, fy0, fx1, fy1, fw, fh = cand[0]
+        else:
+            fx0, fy0, fx1, fy1, fw, fh = Sx0, Sy0, Sx1, Sy1, Sx1 - Sx0, Sy1 - Sy0
+
+        # Escala (unidades de dibujo por metro) a partir del lado mayor real
+        real_major = max(req.frente_m, req.fondo_m, 0.1)
+        fp_major = max(fw, fh, 1e-6)
+        scale = fp_major / real_major
+        radio_u = req.radio_m * scale
+        base_u = max(req.base_m * scale, fp_major * 0.04)
+
+        # Esquina elegida del footprint
+        corners = {
+            "posterior_izq": (fx0, fy1), "posterior_der": (fx1, fy1),
+            "frontal_izq": (fx0, fy0), "frontal_der": (fx1, fy0),
+        }
+        cx, cy = corners.get(req.esquina, (fx0, fy1))
+        inset = fp_major * 0.07
+        cx += inset if "izq" in req.esquina else -inset
+        cy += -inset if "posterior" in req.esquina else inset
+
+        # Capa de la grúa (roja)
+        if "C4-GRUA" not in doc.layers:
+            doc.layers.add("C4-GRUA", color=1)
+        atr = {"layer": "C4-GRUA"}
+        b = base_u / 2
+        msp.add_circle((cx, cy), radio_u, dxfattribs=atr)                       # radio de pluma
+        msp.add_lwpolyline([(cx - b, cy - b), (cx + b, cy - b), (cx + b, cy + b), (cx - b, cy + b), (cx - b, cy - b)], dxfattribs=atr)  # base
+        msp.add_line((cx - b, cy), (cx + b, cy), dxfattribs=atr)                # cruz del mástil
+        msp.add_line((cx, cy - b), (cx, cy + b), dxfattribs=atr)
+        th = max(fp_major * 0.03, base_u * 0.4)
+        msp.add_text(f"GRUA TORRE - {req.modelo}", height=th, dxfattribs=atr).set_placement((cx + base_u, cy + base_u))
+        msp.add_text(f"R={req.radio_m} m  Base={req.base_m} m", height=th * 0.8, dxfattribs=atr).set_placement((cx + base_u, cy + base_u - th * 1.5))
+
+        fd2, tout = tempfile.mkstemp(suffix=".dxf")
+        _os.close(fd2)
+        doc.saveas(tout)
+        with open(tout, "rb") as f:
+            out_b64 = _b64.b64encode(f.read()).decode()
+
+        return {
+            "ok": True,
+            "dxf_base64": out_b64,
+            "posicion": {"x": round(cx, 2), "y": round(cy, 2), "esquina": req.esquina},
+            "medidas": {
+                "frente_m": req.frente_m, "fondo_m": req.fondo_m,
+                "escala_u_por_m": round(scale, 4),
+                "contorno_detectado_u": {"ancho": round(fw, 2), "alto": round(fh, 2)},
+                "lamina_u": {"ancho": round(Sx1 - Sx0, 2), "alto": round(Sy1 - Sy0, 2)},
+                "radio_pluma_u": round(radio_u, 2),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Error ubicando grúa: {traceback.format_exc()}")
+    finally:
+        for t in (tin, tout):
+            if t and _os.path.exists(t):
+                try: _os.remove(t)
+                except Exception: pass
+
+
 # NOTA: arrancar SIEMPRE con uvicorn desde la terminal:
 #     python -m uvicorn main:app --port 8000 --reload
 # No usar `python main.py`: con reload=True deja un proceso huérfano
