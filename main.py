@@ -328,6 +328,86 @@ def endpoint_plano(req: PlanoRequest):
         raise HTTPException(status_code=500, detail=f"Error generando plano: {traceback.format_exc()}")
 
 
+class LeerPlanoRequest(BaseModel):
+    dxf_base64: str
+
+
+@app.post("/leer-plano")
+def endpoint_leer_plano(req: LeerPlanoRequest):
+    """Lee un DXF y extrae capas, textos/leyendas, bloques y dimensiones para que la IA lo interprete."""
+    import base64 as _b64, tempfile, os as _os, ezdxf
+    from collections import Counter
+    tmp = None
+    try:
+        raw = _b64.b64decode(req.dxf_base64)
+        fd, tmp = tempfile.mkstemp(suffix=".dxf")
+        with _os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        try:
+            doc = ezdxf.readfile(tmp)
+        except Exception:
+            # DXF con errores: recuperar
+            from ezdxf import recover
+            doc, _ = recover.readfile(tmp)
+
+        msp = doc.modelspace()
+        textos, bloques, tipos = [], Counter(), Counter()
+        for e in msp:
+            t = e.dxftype()
+            tipos[t] += 1
+            try:
+                if t == "TEXT":
+                    s = (e.dxf.text or "").strip()
+                    if s:
+                        textos.append(s)
+                elif t == "MTEXT":
+                    s = e.plain_text().strip()
+                    if s:
+                        textos.append(s)
+                elif t == "INSERT":
+                    bloques[e.dxf.name] += 1
+            except Exception:
+                pass
+
+        capas = [l.dxf.name for l in doc.layers if l.dxf.name not in ("Defpoints",)]
+
+        ext = None
+        try:
+            emin, emax = doc.header.get("$EXTMIN"), doc.header.get("$EXTMAX")
+            if emin and emax:
+                w, h = abs(emax[0] - emin[0]), abs(emax[1] - emin[1])
+                # ezdxf usa +/-1e20 como default cuando no hay extents reales
+                if 0 < w < 1e9 and 0 < h < 1e9:
+                    ext = {"ancho_u": round(w, 2), "alto_u": round(h, 2)}
+        except Exception:
+            pass
+
+        # Dedup de textos preservando orden, limitar
+        vistos, textos_u = set(), []
+        for s in textos:
+            k = s.lower()
+            if k not in vistos:
+                vistos.add(k); textos_u.append(s)
+
+        return {
+            "ok": True,
+            "capas": capas[:60],
+            "textos": textos_u[:200],
+            "total_textos": len(textos),
+            "bloques": dict(bloques.most_common(40)),
+            "conteo_entidades": dict(tipos.most_common(20)),
+            "total_entidades": sum(tipos.values()),
+            "extents": ext,
+            "dxf_version": doc.dxfversion,
+        }
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Error leyendo DXF: {traceback.format_exc()}")
+    finally:
+        if tmp and _os.path.exists(tmp):
+            try: _os.remove(tmp)
+            except Exception: pass
+
+
 # NOTA: arrancar SIEMPRE con uvicorn desde la terminal:
 #     python -m uvicorn main:app --port 8000 --reload
 # No usar `python main.py`: con reload=True deja un proceso huérfano
