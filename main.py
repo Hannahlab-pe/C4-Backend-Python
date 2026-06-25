@@ -350,8 +350,9 @@ def endpoint_leer_plano(req: LeerPlanoRequest):
             from ezdxf import recover
             doc, _ = recover.readfile(tmp)
 
+        import re
         msp = doc.modelspace()
-        textos, bloques, tipos = [], Counter(), Counter()
+        textos, bloques, tipos = [], Counter(), Counter()  # textos = (str, altura)
         for e in msp:
             t = e.dxftype()
             tipos[t] += 1
@@ -359,15 +360,36 @@ def endpoint_leer_plano(req: LeerPlanoRequest):
                 if t == "TEXT":
                     s = (e.dxf.text or "").strip()
                     if s:
-                        textos.append(s)
+                        textos.append((s, float(getattr(e.dxf, "height", 0) or 0)))
                 elif t == "MTEXT":
                     s = e.plain_text().strip()
                     if s:
-                        textos.append(s)
+                        textos.append((s, float(getattr(e.dxf, "char_height", 0) or 0)))
                 elif t == "INSERT":
                     bloques[e.dxf.name] += 1
             except Exception:
                 pass
+
+        # Niveles (sótanos/pisos/cisterna/azotea) — escanea TODOS los textos, no solo los primeros
+        nivel_re = re.compile(r"(s[oó]tano|semis[oó]tano|piso|azotea|cisterna|nivel|mezz|techo|planta)", re.I)
+        niveles, vist_n = [], set()
+        for s, _h in textos:
+            if len(s) <= 45 and nivel_re.search(s):
+                k = s.lower()
+                if k not in vist_n:
+                    vist_n.add(k); niveles.append(s)
+
+        # Títulos = los textos más grandes (suelen ser los rótulos de cada lámina/nivel)
+        alturas = [h for _s, h in textos if h > 0]
+        titulos = []
+        if alturas:
+            thr = max(alturas) * 0.6
+            vist_t = set()
+            for s, h in textos:
+                if h >= thr and len(s) <= 60:
+                    k = s.lower()
+                    if k not in vist_t:
+                        vist_t.add(k); titulos.append(s)
 
         capas = [l.dxf.name for l in doc.layers if l.dxf.name not in ("Defpoints",)]
 
@@ -384,7 +406,7 @@ def endpoint_leer_plano(req: LeerPlanoRequest):
 
         # Dedup de textos preservando orden, limitar
         vistos, textos_u = set(), []
-        for s in textos:
+        for s, _h in textos:
             k = s.lower()
             if k not in vistos:
                 vistos.add(k); textos_u.append(s)
@@ -392,7 +414,9 @@ def endpoint_leer_plano(req: LeerPlanoRequest):
         return {
             "ok": True,
             "capas": capas[:60],
-            "textos": textos_u[:200],
+            "niveles": niveles[:40],
+            "titulos": titulos[:40],
+            "textos": textos_u[:250],
             "total_textos": len(textos),
             "bloques": dict(bloques.most_common(40)),
             "conteo_entidades": dict(tipos.most_common(20)),
