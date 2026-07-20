@@ -84,6 +84,14 @@ class FinancieroRequest(BaseModel):
     porcentaje_capital_propio: float = Field(40.0, ge=0, le=100)
     velocidad_ventas_mensual: float = Field(0, ge=0)
     mezcla_tipologias: Optional[List[TipologiaInput]] = None
+    factor_tiempo_obra: float = Field(1.0, gt=0, le=1.5, description="Multiplica meses de obra (prefab < 1 = más rápido)")
+    delta_costo_construccion_pct: float = Field(0.0, ge=-50, le=50, description="% de ajuste al costo de construcción/m²")
+    costo_construccion_usd_m2: float = Field(0, ge=0, description="Override del costo de construcción/m² (0 = auto)")
+    area_sotano_m2: float = Field(0, ge=0, description="Área de sótanos a costear con premium")
+
+
+class PrecioMaxTerrenoRequest(FinancieroRequest):
+    tir_objetivo: float = Field(20.0, gt=0, le=100, description="TIR anual objetivo (%) para despejar el precio máximo del terreno")
 
 
 class PlanoRequest(BaseModel):
@@ -199,11 +207,63 @@ def endpoint_financiero(req: FinancieroRequest):
             porcentaje_capital_propio=req.porcentaje_capital_propio,
             velocidad_ventas_mensual=req.velocidad_ventas_mensual,
             mezcla_tipologias=mezcla,
+            factor_tiempo_obra=req.factor_tiempo_obra,
+            delta_costo_construccion_pct=req.delta_costo_construccion_pct,
+            costo_construccion_usd_m2=req.costo_construccion_usd_m2,
+            area_sotano_m2=req.area_sotano_m2,
         )
         resultado = calcular_financiero(entrada)
         return _financiero_to_dict(resultado)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en motor financiero: {str(e)}")
+
+
+@app.post("/precio-maximo-terreno")
+def endpoint_precio_maximo_terreno(req: PrecioMaxTerrenoRequest):
+    """Despeja el precio MÁXIMO del terreno que aún alcanza una TIR objetivo (valor residual)."""
+    from dataclasses import replace
+    try:
+        mezcla = [TipologiaDepto(tipo=t.tipo, porcentaje=t.porcentaje, precio_usd_m2=t.precio_usd_m2)
+                  for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
+        base = EntradaFinanciera(
+            distrito=req.distrito,
+            area_vendible_m2=req.area_vendible_m2,
+            area_construida_m2=req.area_construida_m2,
+            num_departamentos=req.num_departamentos,
+            num_pisos=req.num_pisos,
+            precio_terreno_usd=0,
+            precio_venta_usd_m2=req.precio_venta_usd_m2,
+            area_demolicion_m2=req.area_demolicion_m2,
+            porcentaje_capital_propio=req.porcentaje_capital_propio,
+            velocidad_ventas_mensual=req.velocidad_ventas_mensual,
+            mezcla_tipologias=mezcla,
+            costo_construccion_usd_m2=req.costo_construccion_usd_m2,
+            area_sotano_m2=req.area_sotano_m2,
+        )
+        objetivo = req.tir_objetivo
+
+        def tir_de(precio: float) -> float:
+            return calcular_financiero(replace(base, precio_terreno_usd=precio)).tir_anual_pct
+
+        # Con terreno casi gratis, TIR es la máxima posible. Si ni así llega al objetivo → no alcanzable.
+        r0 = calcular_financiero(replace(base, precio_terreno_usd=1.0))
+        if r0.tir_anual_pct < objetivo:
+            return {"precio_maximo_usd": 0, "alcanzable": False, "tir_objetivo": objetivo,
+                    "tir_max_posible": round(r0.tir_anual_pct, 1), "financiero": _financiero_to_dict(r0)}
+
+        # Bisección: la TIR baja monótonamente al subir el precio del terreno.
+        lo, hi = 0.0, max(r0.ingreso_total_usd, 1.0)
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            if tir_de(mid) >= objetivo:
+                lo = mid
+            else:
+                hi = mid
+        r = calcular_financiero(replace(base, precio_terreno_usd=lo))
+        return {"precio_maximo_usd": round(lo, 0), "alcanzable": True, "tir_objetivo": objetivo,
+                "financiero": _financiero_to_dict(r)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en precio máximo: {str(e)}")
 
 
 @app.post("/analisis-completo")

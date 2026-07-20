@@ -154,6 +154,11 @@ class EntradaFinanciera:
     porcentaje_capital_propio: float = 40.0    # % del costo total que aporta el inversor
     velocidad_ventas_mensual: float = 0         # 0 = default del distrito
     mezcla_tipologias: Optional[list[TipologiaDepto]] = None
+    # Sistema constructivo (comparador prefab vs tradicional):
+    factor_tiempo_obra: float = 1.0            # multiplica los meses de obra (prefab < 1 = más rápido)
+    delta_costo_construccion_pct: float = 0.0  # % de ajuste al costo de construcción/m² (prefab +/-)
+    costo_construccion_usd_m2: float = 0        # override del costo de construcción/m² (0 = auto por distrito/pisos)
+    area_sotano_m2: float = 0                   # área de sótanos (se costea con premium por excavación/calzaduras)
 
 
 @dataclass
@@ -190,6 +195,7 @@ class ResultadoFinanciero:
     costo_financiamiento_usd: float
     costo_total_usd: float
     costo_usd_m2_construido: float
+    costo_construccion_m2: float
 
     # Utilidad
     utilidad_bruta_usd: float
@@ -199,6 +205,7 @@ class ResultadoFinanciero:
 
     # Indicadores
     tir_anual_pct: float
+    irr_anual_pct: float
     van_usd: float
     payback_meses: int
     punto_equilibrio_deptos: int
@@ -223,21 +230,23 @@ class ResultadoFinanciero:
 def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     d = entrada.distrito
 
-    costo_m2  = _costo_construccion_usd_m2(d, entrada.num_pisos)
+    costo_m2_base = entrada.costo_construccion_usd_m2 if entrada.costo_construccion_usd_m2 > 0 else _costo_construccion_usd_m2(d, entrada.num_pisos)
+    costo_m2  = costo_m2_base * (1 + entrada.delta_costo_construccion_pct / 100.0)
     precio_m2 = entrada.precio_venta_usd_m2 or _precio_ponderado(d, entrada.mezcla_tipologias)
     # Guarda final: nunca dejar precio en 0 (colapsa ingresos y TIR)
     if not precio_m2 or precio_m2 <= 0:
         precio_m2 = PRECIO_VENTA_USD_M2.get(d, PRECIO_VENTA_USD_M2["default"])
     vel_ventas = entrada.velocidad_ventas_mensual or VELOCIDAD_VENTAS.get(d, VELOCIDAD_VENTAS["default"])
 
-    meses_obra  = _estimar_meses_obra(entrada.area_construida_m2)
+    meses_obra  = max(6, round(_estimar_meses_obra(entrada.area_construida_m2) * entrada.factor_tiempo_obra))
     meses_total = MESES_PREOBRA + meses_obra + MESES_POSTENTREGA
 
     # ── Costos ────────────────────────────────────────────────────────────────
     costo_terreno     = entrada.precio_terreno_usd or (entrada.area_vendible_m2 * precio_m2 * 0.18)
     costo_alcabala    = costo_terreno * R_ALCABALA
     costo_demolicion  = entrada.area_demolicion_m2 * COSTO_DEMO_M2
-    costo_construccion = entrada.area_construida_m2 * costo_m2
+    # Vivienda + sótanos (los sótanos cuestan más: excavación, calzaduras, muros de contención → +40%)
+    costo_construccion = entrada.area_construida_m2 * costo_m2 + entrada.area_sotano_m2 * costo_m2 * 1.4
     costo_licencias   = costo_construccion * R_LICENCIAS
     costo_supervision = costo_construccion * R_SUPERVISION
     costo_gerencia    = costo_construccion * R_GERENCIA
@@ -313,6 +322,10 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     tasa_m = (1 + TASA_DESCUENTO) ** (1 / 12) - 1
     van = sum(f / (1 + tasa_m) ** (i + 1) for i, f in enumerate(flujos_proyecto))
 
+    # IRR real: TIR mensual del flujo del proyecto, anualizada (coherente con el gráfico de flujo de caja)
+    irr_m     = _tir(flujos_proyecto)
+    irr_anual = ((1 + irr_m) ** 12 - 1) * 100 if irr_m > 0 else 0.0
+
     payback     = next((f.mes for f in flujo if f.flujo_equity_acum >= 0), meses_total)
     ing_x_depto = ingreso_total / entrada.num_departamentos if entrada.num_departamentos > 0 else 1
     punto_eq    = math.ceil(costo_total / ing_x_depto) if ing_x_depto > 0 else 0
@@ -334,11 +347,13 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
         costo_financiamiento_usd   = round(costo_financiamiento, 0),
         costo_total_usd            = round(costo_total, 0),
         costo_usd_m2_construido    = round(costo_total / entrada.area_construida_m2, 0) if entrada.area_construida_m2 > 0 else 0,
+        costo_construccion_m2      = round(costo_m2, 0),
         utilidad_bruta_usd         = round(utilidad_bruta, 0),
         impuestos_estimados_usd    = round(impuestos, 0),
         utilidad_neta_usd          = round(utilidad_neta, 0),
         margen_neto_pct            = round(margen_neto, 1),
         tir_anual_pct              = round(tir_anual, 1),
+        irr_anual_pct              = round(irr_anual, 1),
         van_usd                    = round(van, 0),
         payback_meses              = payback,
         punto_equilibrio_deptos    = punto_eq,
