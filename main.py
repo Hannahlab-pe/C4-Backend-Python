@@ -608,6 +608,163 @@ def endpoint_ubicar_grua(req: UbicarGruaRequest):
                 except Exception: pass
 
 
+class MetradoDxfRequest(BaseModel):
+    dxf_base64: str
+
+
+@app.post("/metrado-dxf")
+def endpoint_metrado_dxf(req: MetradoDxfRequest):
+    """Lee un DXF y MIDE áreas por capa (polilíneas cerradas + hatch) para armar un metrado.
+    Detecta la escala (unidades) de forma robusta con las cotas y sugiere una partida por capa."""
+    import base64 as _b64, tempfile, os as _os, ezdxf, re
+    from ezdxf import path as ezpath
+    from collections import defaultdict
+    tmp = None
+
+    def shoelace(pts):
+        if len(pts) < 3:
+            return 0.0
+        a = 0.0
+        for i in range(len(pts)):
+            x1, y1 = pts[i]; x2, y2 = pts[(i + 1) % len(pts)]
+            a += x1 * y2 - x2 * y1
+        return abs(a) / 2.0
+
+    def sugerir(capa: str):
+        c = capa.lower()
+        if "prelosa" in c or ("losa" in c and "aligerad" in c): return "Losa aligerada (prelosa)"
+        if "losa" in c or "techo" in c or "suelo" in c: return "Losa"
+        if "doppel" in c or "muro" in c: return "Muro"
+        if "columna" in c or "pilar" in c: return "Columna"
+        if "casco" in c: return "Casco estructural"
+        if "cimentac" in c or "zapata" in c or "solado" in c: return "Cimentación"
+        if "viga" in c: return "Viga"
+        return None
+
+    try:
+        raw = _b64.b64decode(req.dxf_base64)
+        fd, tmp = tempfile.mkstemp(suffix=".dxf")
+        with _os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        try:
+            doc = ezdxf.readfile(tmp)
+        except Exception:
+            from ezdxf import recover
+            doc, _ = recover.readfile(tmp)
+        msp = doc.modelspace()
+
+        # ── Escala: unidades del dibujo → metros (las cotas mandan sobre el flag INSUNITS) ──
+        insunits = int(doc.header.get("$INSUNITS", 0) or 0)
+        dims = []
+        for d in msp.query("DIMENSION"):
+            try:
+                m = d.get_measurement()
+                if isinstance(m, (int, float)) and m > 0:
+                    dims.append(float(m))
+            except Exception:
+                pass
+        factor = None; unidad = None; confianza = "baja"
+        if dims:
+            dims.sort()
+            ref = dims[min(int(len(dims) * 0.9), len(dims) - 1)]  # dimensión grande (percentil 90)
+            if ref > 100: factor, unidad = 0.001, "mm"
+            elif ref > 30: factor, unidad = 0.01, "cm"
+            else: factor, unidad = 1.0, "m"
+            confianza = "alta"
+        if factor is None:
+            factor = {4: 0.001, 5: 0.01, 6: 1.0}.get(insunits, 1.0)
+            unidad = {4: "mm", 5: "cm", 6: "m"}.get(insunits, "m (asumido)")
+        factor_area = factor * factor
+
+        # ── Áreas por capa (polilíneas cerradas + hatch), descartando capas de apoyo ──
+        SOPORTE = {"Defpoints", "FIERRO", "A-FIERRO", "ESTRIBOS", "ACERO"}
+        cerr_area = defaultdict(float); cerr_n = defaultdict(int)
+        hatch_area = defaultdict(float); hatch_n = defaultdict(int)
+        textos = []
+        n_ent = 0
+        for e in msp:
+            n_ent += 1
+            t = e.dxftype(); capa = getattr(e.dxf, "layer", "0")
+            if capa in SOPORTE:
+                continue
+            if t == "LWPOLYLINE" and getattr(e, "closed", False):
+                try:
+                    a = shoelace([(p[0], p[1]) for p in e.get_points("xy")]) * factor_area
+                    if a > 0.05:
+                        cerr_area[capa] += a; cerr_n[capa] += 1
+                except Exception:
+                    pass
+            elif t == "HATCH":
+                try:
+                    tot = 0.0; ok = False
+                    for p in ezpath.from_hatch(e):
+                        pp = [(v.x, v.y) for v in p.flattening(0.1)]
+                        if len(pp) >= 3:
+                            tot += shoelace(pp); ok = True
+                    a = tot * factor_area
+                    if ok and a > 0.05:
+                        hatch_area[capa] += a; hatch_n[capa] += 1
+                except Exception:
+                    pass
+            elif t in ("TEXT", "MTEXT"):
+                try:
+                    s = (e.plain_text() if t == "MTEXT" else (e.dxf.text or "")).strip()
+                    if s:
+                        textos.append(s)
+                except Exception:
+                    pass
+
+        # Una capa es "detalle" (ruido de la lámina, no obra) si su nombre lo delata,
+        # tiene prefijo _ / -, o el área es muy chica (dibujitos de corte/leyenda).
+        DET = re.compile(r"(detalle|detail|leyenda|cuadro|tabla|secci|corte|croquis|\bnota)", re.I)
+        def es_detalle(capa: str, area: float) -> bool:
+            c = (capa or "").strip()
+            if DET.search(c): return True
+            if c[:1] in ("_", "-"): return True
+            if area < 5: return True
+            return False
+
+        capas = []
+        for capa in set(list(cerr_area) + list(hatch_area)):
+            area = round(cerr_area.get(capa, 0.0) + hatch_area.get(capa, 0.0), 2)
+            if area <= 0:
+                continue
+            capas.append({
+                "capa": capa,
+                "area_m2": area,
+                "n_cerradas": cerr_n.get(capa, 0),
+                "n_hatch": hatch_n.get(capa, 0),
+                "partida_sugerida": sugerir(capa),
+                "es_detalle": es_detalle(capa, area),
+            })
+        capas.sort(key=lambda x: -x["area_m2"])
+
+        # Textos con material / altura (para trazabilidad "de dónde salió")
+        kw = re.compile(r"(muro|doppel|prelosa|losa|column|pilar|zapata|ciment|solado|viga|f.?c\s*=|h\s*=|e\s*=|npt|nfz)", re.I)
+        vist, clave = set(), []
+        for s in textos:
+            if len(s) <= 70 and kw.search(s):
+                k = s.lower()
+                if k not in vist:
+                    vist.add(k); clave.append(s)
+
+        return {
+            "ok": True,
+            "unidad_detectada": unidad,
+            "factor_a_metros": factor,
+            "escala_confianza": confianza,
+            "capas": capas[:40],
+            "textos_clave": clave[:40],
+            "total_entidades": n_ent,
+        }
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Error midiendo DXF: {traceback.format_exc()}")
+    finally:
+        if tmp and _os.path.exists(tmp):
+            try: _os.remove(tmp)
+            except Exception: pass
+
+
 # NOTA: arrancar SIEMPRE con uvicorn desde la terminal:
 #     python -m uvicorn main:app --port 8000 --reload
 # No usar `python main.py`: con reload=True deja un proceso huérfano
