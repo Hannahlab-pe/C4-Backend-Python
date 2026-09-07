@@ -20,6 +20,7 @@ FY_KGF_CM2 = 4200       # fy acero corrugado grado 60
 CARGA_VIVA_KGF_M2 = 200 # sobrecarga de servicio vivienda (kg/m²)
 CARGA_MUERTA_KGF_M2 = 500  # carga muerta total estimada (losa + acabados + muros)
 PESO_CONCRETO_TM3 = 2.4    # ton/m³
+ALTURA_PISO_M = 3.0        # altura libre de entrepiso (m) — altura de la columna por piso
 
 
 @dataclass
@@ -100,8 +101,11 @@ def predimensionar(entrada: EntradaEstructural) -> ResultadoEstructural:
     lado_col_cm = math.ceil(math.sqrt(Ag_cm2) / 5) * 5  # cuadrada, múltiplo 5cm
     lado_col_cm = max(25, lado_col_cm)  # mínimo 25cm
 
-    vol_columnas = (lado_col_cm / 100) ** 2 * CARGA_MUERTA_KGF_M2/1000 * n * num_columnas * 3.0
-    acero_columnas_kg = 0.01 * (lado_col_cm / 100) ** 2 * n * 3.0 * num_columnas * 1000 * 7.85
+    # Volumen = sección × altura de columna × pisos × número de columnas.
+    # (Antes multiplicaba por CARGA_MUERTA_KGF_M2/1000, que es una carga, no una
+    #  longitud: valía 0.5 y dejaba el concreto de columnas a la mitad.)
+    vol_columnas = (lado_col_cm / 100) ** 2 * ALTURA_PISO_M * n * num_columnas
+    acero_columnas_kg = 0.01 * vol_columnas * 1000 * 7.85  # cuantía 1% × 7.85 kg/dm³
 
     # ── 4. Totales ──────────────────────────────────────────────────────────
     concreto_total = vol_vigas_total + vol_losa_total + vol_columnas
