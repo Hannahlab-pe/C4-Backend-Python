@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+import calibracion as cb
+
 
 # ─── Costos de construcción calibrados (USD/m², Lima 2026) ──────────────────
 #
@@ -62,24 +64,39 @@ _FACTOR_ZONA: dict = {
 _MULT_CONTRATISTA = 1.20
 
 
-def _costo_construccion_usd_m2(distrito: str, num_pisos: int = 8) -> float:
+# Clave de calibración de cada tramo de pisos (mismo orden que _CD_BASE_POR_PISOS)
+_CLAVES_CD = ["costo_directo_cd_hasta_3", "costo_directo_cd_4_7", "costo_directo_cd_8_10",
+              "costo_directo_cd_11_15", "costo_directo_cd_16_mas"]
+
+
+def _costo_construccion_usd_m2(distrito: str, num_pisos: int = 8, cal: cb.Calibracion = None) -> float:
     """
     Retorna el costo de construcción en USD/m² de área construida que pagará
     el desarrollador al contratista (CD × factor_pisos × factor_zona × 1.20).
 
-    Basado en Tipología B Revista Costos Enero 2026 (multifamiliar Lima).
+    Basado en Tipología B Revista Costos Enero 2026 (multifamiliar Lima), salvo que
+    un experto haya confirmado otros valores (ver calibracion.py).
     """
-    cd_base = _CD_BASE_POR_PISOS[-1][1]
-    for tope, valor in _CD_BASE_POR_PISOS:
+    idx = len(_CD_BASE_POR_PISOS) - 1
+    for i, (tope, _valor) in enumerate(_CD_BASE_POR_PISOS):
         if num_pisos <= tope:
-            cd_base = valor
+            idx = i
             break
-    factor_zona = _FACTOR_ZONA.get(distrito, _FACTOR_ZONA["default"])
-    return round(cd_base * factor_zona * _MULT_CONTRATISTA, 0)
+    cd_base = cb.num(cal, _CLAVES_CD[idx], _CD_BASE_POR_PISOS[idx][1])
+    factor_zona = cb.por_distrito(cal, "factor_zona", distrito,
+                                  _FACTOR_ZONA.get(distrito, _FACTOR_ZONA["default"]))
+    mult = cb.num(cal, "mult_contratista", _MULT_CONTRATISTA)
+    return round(cd_base * factor_zona * mult, 0)
+
+
+def _precio_venta(distrito: str, cal: cb.Calibracion = None) -> float:
+    """Precio de venta del distrito, calibrado si alguien lo confirmó."""
+    return cb.por_distrito(cal, "precio_venta", distrito,
+                           PRECIO_VENTA_USD_M2.get(distrito, PRECIO_VENTA_USD_M2["default"]))
 
 
 # Tabla de compatibilidad (usada internamente cuando no se conocen los pisos)
-COSTO_CONST_USD_M2: dict = {d: _costo_construccion_usd_m2(d, 8) for d in _FACTOR_ZONA}
+COSTO_CONST_USD_M2: dict = {d: _costo_construccion_usd_m2(d, 8, None) for d in _FACTOR_ZONA}
 
 PRECIO_VENTA_USD_M2: dict = {
     "San Isidro":        3500,
@@ -159,6 +176,9 @@ class EntradaFinanciera:
     delta_costo_construccion_pct: float = 0.0  # % de ajuste al costo de construcción/m² (prefab +/-)
     costo_construccion_usd_m2: float = 0        # override del costo de construcción/m² (0 = auto por distrito/pisos)
     area_sotano_m2: float = 0                   # área de sótanos (se costea con premium por excavación/calzaduras)
+    # Supuestos confirmados por un experto y aprobados en C4 (ver calibracion.py).
+    # Lo que no venga aquí usa la constante de siempre.
+    calibracion: Optional[dict] = None
 
 
 @dataclass
@@ -229,33 +249,39 @@ class ResultadoFinanciero:
 
 def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     d = entrada.distrito
+    cal = entrada.calibracion   # valores confirmados por un experto (o None)
 
-    costo_m2_base = entrada.costo_construccion_usd_m2 if entrada.costo_construccion_usd_m2 > 0 else _costo_construccion_usd_m2(d, entrada.num_pisos)
+    costo_m2_base = entrada.costo_construccion_usd_m2 if entrada.costo_construccion_usd_m2 > 0 else _costo_construccion_usd_m2(d, entrada.num_pisos, cal)
     costo_m2  = costo_m2_base * (1 + entrada.delta_costo_construccion_pct / 100.0)
-    precio_m2 = entrada.precio_venta_usd_m2 or _precio_ponderado(d, entrada.mezcla_tipologias)
+    precio_m2 = entrada.precio_venta_usd_m2 or _precio_ponderado(d, entrada.mezcla_tipologias, cal)
     # Guarda final: nunca dejar precio en 0 (colapsa ingresos y TIR)
     if not precio_m2 or precio_m2 <= 0:
-        precio_m2 = PRECIO_VENTA_USD_M2.get(d, PRECIO_VENTA_USD_M2["default"])
-    vel_ventas = entrada.velocidad_ventas_mensual or VELOCIDAD_VENTAS.get(d, VELOCIDAD_VENTAS["default"])
+        precio_m2 = _precio_venta(d, cal)
+    vel_ventas = entrada.velocidad_ventas_mensual or cb.por_distrito(
+        cal, "velocidad_ventas", d, VELOCIDAD_VENTAS.get(d, VELOCIDAD_VENTAS["default"]))
 
     meses_obra  = max(6, round(_estimar_meses_obra(entrada.area_construida_m2) * entrada.factor_tiempo_obra))
-    meses_total = MESES_PREOBRA + meses_obra + MESES_POSTENTREGA
+    meses_pre   = max(0, round(cb.num(cal, "meses_preobra", MESES_PREOBRA)))
+    meses_post  = max(0, round(cb.num(cal, "meses_postentrega", MESES_POSTENTREGA)))
+    meses_total = meses_pre + meses_obra + meses_post
 
     # ── Costos ────────────────────────────────────────────────────────────────
-    costo_terreno     = entrada.precio_terreno_usd or (entrada.area_vendible_m2 * precio_m2 * 0.18)
-    costo_alcabala    = costo_terreno * R_ALCABALA
-    costo_demolicion  = entrada.area_demolicion_m2 * COSTO_DEMO_M2
+    pct_terreno       = cb.pct(cal, "terreno_pct_valor_venta", 0.18)
+    costo_terreno     = entrada.precio_terreno_usd or (entrada.area_vendible_m2 * precio_m2 * pct_terreno)
+    costo_alcabala    = costo_terreno * cb.pct(cal, "ratio_alcabala", R_ALCABALA)
+    costo_demolicion  = entrada.area_demolicion_m2 * cb.num(cal, "costo_demolicion_m2", COSTO_DEMO_M2)
     # Vivienda + sótanos (los sótanos cuestan más: excavación, calzaduras, muros de contención → +40%)
-    costo_construccion = entrada.area_construida_m2 * costo_m2 + entrada.area_sotano_m2 * costo_m2 * 1.4
-    costo_licencias   = costo_construccion * R_LICENCIAS
-    costo_supervision = costo_construccion * R_SUPERVISION
-    costo_gerencia    = costo_construccion * R_GERENCIA
-    costo_imprevistos = costo_construccion * R_IMPREVISTOS
+    factor_sotano = cb.num(cal, "factor_sotano", 1.4)
+    costo_construccion = entrada.area_construida_m2 * costo_m2 + entrada.area_sotano_m2 * costo_m2 * factor_sotano
+    costo_licencias   = costo_construccion * cb.pct(cal, "ratio_licencias_diseno", R_LICENCIAS)
+    costo_supervision = costo_construccion * cb.pct(cal, "ratio_supervision", R_SUPERVISION)
+    costo_gerencia    = costo_construccion * cb.pct(cal, "ratio_gerencia", R_GERENCIA)
+    costo_imprevistos = costo_construccion * cb.pct(cal, "ratio_imprevistos", R_IMPREVISTOS)
 
     ingreso_total   = entrada.area_vendible_m2 * precio_m2
-    costo_marketing = ingreso_total * R_MARKETING
-    costo_corretaje = ingreso_total * R_CORRETAJE
-    costo_titulacion = ingreso_total * R_TITULACION
+    costo_marketing = ingreso_total * cb.pct(cal, "ratio_marketing", R_MARKETING)
+    costo_corretaje = ingreso_total * cb.pct(cal, "ratio_corretaje", R_CORRETAJE)
+    costo_titulacion = ingreso_total * cb.pct(cal, "ratio_titulacion", R_TITULACION)
 
     costo_operativo = (
         costo_terreno + costo_alcabala + costo_demolicion +
@@ -273,17 +299,18 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     ventas_por_mes = _distribuir_ventas(
         num_departamentos=entrada.num_departamentos,
         vel_ventas=vel_ventas,
-        meses_preobra=MESES_PREOBRA,
+        meses_preobra=meses_pre,
         meses_obra=meses_obra,
-        meses_postentrega=MESES_POSTENTREGA,
+        meses_postentrega=meses_post,
     )
     ingreso_por_depto = ingreso_total / entrada.num_departamentos if entrada.num_departamentos > 0 else 0
 
     # ── Flujo mensual ──────────────────────────────────────────────────────────
     flujo, costo_financiamiento = _construir_flujo(
-        meses_preobra=MESES_PREOBRA,
+        cal=cal,
+        meses_preobra=meses_pre,
         meses_obra=meses_obra,
-        meses_postentrega=MESES_POSTENTREGA,
+        meses_postentrega=meses_post,
         costo_terreno=costo_terreno,
         costo_alcabala=costo_alcabala,
         costo_demolicion=costo_demolicion,
@@ -306,7 +333,7 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
 
     # ── Indicadores ───────────────────────────────────────────────────────────
     utilidad_bruta = ingreso_total - costo_total
-    impuestos      = max(0.0, utilidad_bruta * R_IMPUESTOS)
+    impuestos      = max(0.0, utilidad_bruta * cb.pct(cal, "ratio_impuestos", R_IMPUESTOS))
     utilidad_neta  = utilidad_bruta - impuestos
     margen_neto    = (utilidad_neta / ingreso_total * 100) if ingreso_total > 0 else 0
 
@@ -319,7 +346,7 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
 
     # VAN sobre flujos all-equity del proyecto (más confiable que TIR para viabilidad)
     flujos_proyecto = [f.flujo_neto for f in flujo]
-    tasa_m = (1 + TASA_DESCUENTO) ** (1 / 12) - 1
+    tasa_m = (1 + cb.pct(cal, "tasa_descuento", TASA_DESCUENTO)) ** (1 / 12) - 1
     van = sum(f / (1 + tasa_m) ** (i + 1) for i, f in enumerate(flujos_proyecto))
 
     # IRR real: TIR mensual del flujo del proyecto, anualizada (coherente con el gráfico de flujo de caja)
@@ -357,9 +384,9 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
         van_usd                    = round(van, 0),
         payback_meses              = payback,
         punto_equilibrio_deptos    = punto_eq,
-        meses_preobra              = MESES_PREOBRA,
+        meses_preobra              = meses_pre,
         meses_construccion         = meses_obra,
-        meses_postentrega          = MESES_POSTENTREGA,
+        meses_postentrega          = meses_post,
         meses_proyecto             = meses_total,
         velocidad_ventas_mensual   = vel_ventas,
         monto_prestamo_usd         = round(monto_banco, 0),
@@ -370,8 +397,9 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _precio_ponderado(distrito: str, mezcla: Optional[list[TipologiaDepto]]) -> float:
-    base = PRECIO_VENTA_USD_M2.get(distrito, PRECIO_VENTA_USD_M2["default"])
+def _precio_ponderado(distrito: str, mezcla: Optional[list[TipologiaDepto]],
+                      cal: cb.Calibracion = None) -> float:
+    base = _precio_venta(distrito, cal)
     if not mezcla:
         return base
     total_pct = sum(t.porcentaje for t in mezcla)
@@ -436,6 +464,7 @@ def _scurve(mes_obra: int, total_meses: int, costo_total: float) -> float:
 
 
 def _construir_flujo(
+    cal: cb.Calibracion,
     meses_preobra: int,
     meses_obra: int,
     meses_postentrega: int,
@@ -463,8 +492,9 @@ def _construir_flujo(
     ingresos_calendario = [0.0] * meses_total
     for _i, _units in enumerate(ventas_por_mes):
         if _units > 0:
-            _cuota   = _units * ingreso_por_depto * PCT_CUOTA_INICIAL
-            _entrega = _units * ingreso_por_depto * (1.0 - PCT_CUOTA_INICIAL)
+            _pct_ini = cb.pct(cal, "pct_cuota_inicial", PCT_CUOTA_INICIAL)
+            _cuota   = _units * ingreso_por_depto * _pct_ini
+            _entrega = _units * ingreso_por_depto * (1.0 - _pct_ini)
             ingresos_calendario[_i] += _cuota
             _dest = mes_entrega_idx if _i <= mes_entrega_idx else _i
             ingresos_calendario[_dest] += _entrega
@@ -520,7 +550,7 @@ def _construir_flujo(
 
         if monto_banco > 0:
             if not banco_habilitado and num_departamentos > 0:
-                if acum_unidades >= num_departamentos * PRESALES_MIN:
+                if acum_unidades >= num_departamentos * cb.pct(cal, "presales_min", PRESALES_MIN):
                     banco_habilitado = True
 
             # Desembolso en tractos durante la obra
@@ -535,7 +565,8 @@ def _construir_flujo(
 
             # Interés sobre saldo vivo
             if saldo_banco > 0:
-                interes_mes      = saldo_banco * TASA_BANCO_MENS
+                _tasa_m          = (1 + cb.pct(cal, "tasa_banco_anual", TASA_BANCO_ANUAL)) ** (1/12) - 1
+                interes_mes      = saldo_banco * _tasa_m
                 total_intereses += interes_mes
                 egreso          += interes_mes
 

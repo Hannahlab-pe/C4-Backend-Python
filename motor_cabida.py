@@ -12,6 +12,8 @@ Lógica:
 """
 
 import math
+
+import calibracion as cb
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -112,7 +114,14 @@ def _area_efectiva_depto(mezcla: list, area_min: float) -> float:
     return max(area_min, round(avg, 1))
 
 
-def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologias: list = None) -> ResultadoCabida:
+def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologias: list = None,
+                    calibracion: dict = None) -> ResultadoCabida:
+    # Constantes de oficio, reemplazables por lo que confirmó un experto (calibracion.py)
+    cal = calibracion
+    f_vendible = cb.pct(cal, "factor_vendible", FACTOR_VENDIBLE)
+    m2_estac   = cb.num(cal, "m2_por_estacionamiento", M2_POR_ESTACIONAMIENTO)
+    max_sot    = max(0, round(cb.num(cal, "max_sotanos", MAX_SOTANOS)))
+
     # 1. Dimensiones del terreno
     frente, fondo = _inferir_dimensiones(terreno)
 
@@ -139,7 +148,7 @@ def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologi
 
     # 5. Áreas totales
     area_construida_bruta = planta_libre * pisos_vivienda
-    area_vendible_total = area_construida_bruta * FACTOR_VENDIBLE
+    area_vendible_total = area_construida_bruta * f_vendible
     area_no_vendible = area_construida_bruta - area_vendible_total
 
     # 6. Departamentos — usa área efectiva de la mezcla si el usuario la definió
@@ -148,19 +157,19 @@ def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologi
 
     # 7. Estacionamientos
     estacionamientos_requeridos = math.ceil(num_departamentos * normativa.estacionamientos)
-    m2_estacionamiento = estacionamientos_requeridos * M2_POR_ESTACIONAMIENTO
+    m2_estacionamiento = estacionamientos_requeridos * m2_estac
 
     # ¿Caben en planta baja?
     estac_en_pb = min(
         estacionamientos_requeridos,
-        math.floor(planta_libre * 0.85 / M2_POR_ESTACIONAMIENTO)  # 85% de PB para estac.
+        math.floor(planta_libre * 0.85 / m2_estac)  # 85% de PB para estac.
     )
     estac_en_sotano = estacionamientos_requeridos - estac_en_pb
 
     # ¿Cuántos sótanos necesitamos?
-    estac_por_sotano = math.floor(planta_libre * 0.85 / M2_POR_ESTACIONAMIENTO)
+    estac_por_sotano = math.floor(planta_libre * 0.85 / m2_estac)
     sotanos_necesarios = math.ceil(estac_en_sotano / estac_por_sotano) if estac_por_sotano > 0 else 0
-    sotanos = min(sotanos_necesarios, MAX_SOTANOS)
+    sotanos = min(sotanos_necesarios, max_sot)
 
     # 8. Distribución por pisos
     pisos_detalle = _distribuir_pisos(
@@ -171,6 +180,8 @@ def calcular_cabida(terreno: DatosTerreno, normativa: Normativa, mezcla_tipologi
         estac_en_sotano=estac_en_sotano,
         area_min_depto=area_depto_efectiva,
         estac_por_sotano=estac_por_sotano,
+        m2_estac=m2_estac,
+        f_vendible=f_vendible,
     )
 
     # 9. CUS utilizado
@@ -217,6 +228,8 @@ def _distribuir_pisos(
     estac_en_sotano: int,
     area_min_depto: float,
     estac_por_sotano: int,
+    m2_estac: float = M2_POR_ESTACIONAMIENTO,
+    f_vendible: float = FACTOR_VENDIBLE,
 ) -> list[PlantaPiso]:
     resultado = []
 
@@ -234,7 +247,7 @@ def _distribuir_pisos(
 
     # Planta baja
     if estac_en_pb > 0:
-        area_estac = estac_en_pb * M2_POR_ESTACIONAMIENTO
+        area_estac = estac_en_pb * m2_estac
         area_lobby = planta_libre * 0.15
         resultado.append(PlantaPiso(
             numero_piso=0,
@@ -255,7 +268,7 @@ def _distribuir_pisos(
     # Pisos de vivienda
     for p in range(1, pisos_vivienda + 1):
         area_bruta_piso = planta_libre
-        area_vendible_piso = area_bruta_piso * FACTOR_VENDIBLE
+        area_vendible_piso = area_bruta_piso * f_vendible
         deptos_piso = math.floor(area_vendible_piso / area_min_depto)
         resultado.append(PlantaPiso(
             numero_piso=p,

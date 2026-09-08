@@ -64,6 +64,9 @@ class CabidaRequest(BaseModel):
     terreno: TerrenoInput
     normativa: NormativaInput
     mezcla_tipologias: Optional[List[TipologiaInput]] = None
+    # Supuestos que un experto confirmó y C4 aprobó (ver calibracion.py).
+    # Lo que no venga aquí usa la constante por defecto del motor.
+    calibracion: Optional[dict] = None
 
 
 class EstructuralRequest(BaseModel):
@@ -86,6 +89,9 @@ class FinancieroRequest(BaseModel):
     mezcla_tipologias: Optional[List[TipologiaInput]] = None
     factor_tiempo_obra: float = Field(1.0, gt=0, le=1.5, description="Multiplica meses de obra (prefab < 1 = más rápido)")
     delta_costo_construccion_pct: float = Field(0.0, ge=-50, le=50, description="% de ajuste al costo de construcción/m²")
+    # Supuestos que un experto confirmó y C4 aprobó (ver calibracion.py).
+    # Lo que no venga aquí usa la constante por defecto del motor.
+    calibracion: Optional[dict] = None
     costo_construccion_usd_m2: float = Field(0, ge=0, description="Override del costo de construcción/m² (0 = auto)")
     area_sotano_m2: float = Field(0, ge=0, description="Área de sótanos a costear con premium")
 
@@ -140,6 +146,8 @@ class AnalisisCompletoRequest(BaseModel):
     porcentaje_capital_propio: float = Field(40.0, ge=0, le=100)
     velocidad_ventas_mensual: float = Field(0, ge=0)
     mezcla_tipologias: Optional[List[TipologiaInput]] = None
+    # Supuestos que un experto confirmó y C4 aprobó (ver calibracion.py).
+    calibracion: Optional[dict] = None
 
 
 # ─── Endpoints ─────────────────────────────────────────────────────────────
@@ -168,7 +176,8 @@ def endpoint_cabida(req: CabidaRequest):
             estacionamientos=req.normativa.estacionamientos,
         )
         mezcla = [{'tipo': t.tipo, 'porcentaje': t.porcentaje} for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
-        resultado = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla)
+        resultado = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla,
+                                    calibracion=req.calibracion)
         return _cabida_to_dict(resultado)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -211,6 +220,7 @@ def endpoint_financiero(req: FinancieroRequest):
             delta_costo_construccion_pct=req.delta_costo_construccion_pct,
             costo_construccion_usd_m2=req.costo_construccion_usd_m2,
             area_sotano_m2=req.area_sotano_m2,
+            calibracion=req.calibracion,
         )
         resultado = calcular_financiero(entrada)
         return _financiero_to_dict(resultado)
@@ -237,6 +247,7 @@ def endpoint_precio_maximo_terreno(req: PrecioMaxTerrenoRequest):
             porcentaje_capital_propio=req.porcentaje_capital_propio,
             velocidad_ventas_mensual=req.velocidad_ventas_mensual,
             mezcla_tipologias=mezcla,
+            calibracion=req.calibracion,
             costo_construccion_usd_m2=req.costo_construccion_usd_m2,
             area_sotano_m2=req.area_sotano_m2,
         )
@@ -286,7 +297,8 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             estacionamientos=req.normativa.estacionamientos,
         )
         mezcla_cabida = [{'tipo': t.tipo, 'porcentaje': t.porcentaje} for t in req.mezcla_tipologias] if req.mezcla_tipologias else None
-        cabida = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla_cabida)
+        cabida = calcular_cabida(terreno, normativa, mezcla_tipologias=mezcla_cabida,
+                                 calibracion=req.calibracion)
 
         # 2. Estructural (usa datos de cabida)
         estructura = predimensionar(EntradaEstructural(
@@ -310,6 +322,7 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             porcentaje_capital_propio=req.porcentaje_capital_propio,
             velocidad_ventas_mensual=req.velocidad_ventas_mensual,
             mezcla_tipologias=mezcla,
+            calibracion=req.calibracion,
         ))
 
         return {
