@@ -138,6 +138,13 @@ R_CORRETAJE   = 0.030   # 3% ventas (comisión inmobiliaria)
 R_TITULACION  = 0.015   # 1.5% ventas (SUNARP + notaría compraventa + independización)
 R_IMPUESTOS   = 0.150   # 15% utilidad bruta (IGV + IR simplificado)
 
+# Venta de estacionamientos y depósitos (ingreso aparte de los departamentos).
+# Antes el motor costeaba el sótano pero NO vendía ninguna cochera, lo que hacía que casi
+# todo proyecto saliera "no rentable". Son valores por defecto, calibrables por un experto
+# (precio_cochera_usd / precio_deposito_usd) y visibles en la tarjeta de supuestos.
+PRECIO_COCHERA_USD  = 12000.0  # USD por cajón de estacionamiento (promedio Lima)
+PRECIO_DEPOSITO_USD = 4000.0   # USD por depósito
+
 COSTO_DEMO_M2    = 45.0  # USD/m² demolición estructuras existentes
 TASA_BANCO_ANUAL = 0.11  # 11% anual (crédito promotor inmobiliario Lima 2026)
 TASA_BANCO_MENS  = (1 + TASA_BANCO_ANUAL) ** (1 / 12) - 1
@@ -176,6 +183,8 @@ class EntradaFinanciera:
     delta_costo_construccion_pct: float = 0.0  # % de ajuste al costo de construcción/m² (prefab +/-)
     costo_construccion_usd_m2: float = 0        # override del costo de construcción/m² (0 = auto por distrito/pisos)
     area_sotano_m2: float = 0                   # área de sótanos (se costea con premium por excavación/calzaduras)
+    num_estacionamientos: int = 0               # cajones que se venden (viene de la cabida)
+    num_depositos: int = 0                       # depósitos que se venden (0 = no se consideran)
     # Supuestos confirmados por un experto y aprobados en C4 (ver calibracion.py).
     # Lo que no venga aquí usa la constante de siempre.
     calibracion: Optional[dict] = None
@@ -199,6 +208,11 @@ class ResultadoFinanciero:
     # Ingresos
     ingreso_total_usd: float
     precio_venta_usd_m2: float
+    ingreso_viviendas_usd: float
+    ingreso_cocheras_usd: float
+    ingreso_depositos_usd: float
+    num_estacionamientos: int
+    precio_cochera_usd: float
 
     # Costos desglosados
     costo_terreno_usd: float
@@ -278,7 +292,17 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     costo_gerencia    = costo_construccion * cb.pct(cal, "ratio_gerencia", R_GERENCIA)
     costo_imprevistos = costo_construccion * cb.pct(cal, "ratio_imprevistos", R_IMPREVISTOS)
 
-    ingreso_total   = entrada.area_vendible_m2 * precio_m2
+    # ── Ingresos ──────────────────────────────────────────────────────────────
+    # Los departamentos son el grueso; las cocheras y depósitos se venden aparte y por eso
+    # se suman al total. No contarlas era el motivo real de que casi todo saliera "no rentable":
+    # el sótano se costeaba pero no generaba ni un dólar de venta.
+    precio_cochera  = cb.num(cal, "precio_cochera_usd", PRECIO_COCHERA_USD)
+    precio_deposito = cb.num(cal, "precio_deposito_usd", PRECIO_DEPOSITO_USD)
+    ingreso_viviendas = entrada.area_vendible_m2 * precio_m2
+    ingreso_cocheras  = max(0, entrada.num_estacionamientos) * precio_cochera
+    ingreso_depositos = max(0, entrada.num_depositos) * precio_deposito
+    ingreso_total   = ingreso_viviendas + ingreso_cocheras + ingreso_depositos
+
     costo_marketing = ingreso_total * cb.pct(cal, "ratio_marketing", R_MARKETING)
     costo_corretaje = ingreso_total * cb.pct(cal, "ratio_corretaje", R_CORRETAJE)
     costo_titulacion = ingreso_total * cb.pct(cal, "ratio_titulacion", R_TITULACION)
@@ -360,6 +384,11 @@ def calcular_financiero(entrada: EntradaFinanciera) -> ResultadoFinanciero:
     return ResultadoFinanciero(
         ingreso_total_usd          = round(ingreso_total, 0),
         precio_venta_usd_m2        = round(precio_m2, 0),
+        ingreso_viviendas_usd      = round(ingreso_viviendas, 0),
+        ingreso_cocheras_usd       = round(ingreso_cocheras, 0),
+        ingreso_depositos_usd      = round(ingreso_depositos, 0),
+        num_estacionamientos       = max(0, entrada.num_estacionamientos),
+        precio_cochera_usd         = round(precio_cochera, 0),
         costo_terreno_usd          = round(costo_terreno, 0),
         costo_alcabala_notaria_usd = round(costo_alcabala, 0),
         costo_demolicion_usd       = round(costo_demolicion, 0),

@@ -94,6 +94,8 @@ class FinancieroRequest(BaseModel):
     calibracion: Optional[dict] = None
     costo_construccion_usd_m2: float = Field(0, ge=0, description="Override del costo de construcción/m² (0 = auto)")
     area_sotano_m2: float = Field(0, ge=0, description="Área de sótanos a costear con premium")
+    num_estacionamientos: int = Field(0, ge=0, description="Cajones que se venden (de la cabida)")
+    num_depositos: int = Field(0, ge=0, description="Depósitos que se venden (0 = no se consideran)")
 
 
 class PrecioMaxTerrenoRequest(FinancieroRequest):
@@ -220,6 +222,8 @@ def endpoint_financiero(req: FinancieroRequest):
             delta_costo_construccion_pct=req.delta_costo_construccion_pct,
             costo_construccion_usd_m2=req.costo_construccion_usd_m2,
             area_sotano_m2=req.area_sotano_m2,
+            num_estacionamientos=req.num_estacionamientos,
+            num_depositos=req.num_depositos,
             calibracion=req.calibracion,
         )
         resultado = calcular_financiero(entrada)
@@ -250,6 +254,8 @@ def endpoint_precio_maximo_terreno(req: PrecioMaxTerrenoRequest):
             calibracion=req.calibracion,
             costo_construccion_usd_m2=req.costo_construccion_usd_m2,
             area_sotano_m2=req.area_sotano_m2,
+            num_estacionamientos=req.num_estacionamientos,
+            num_depositos=req.num_depositos,
         )
         objetivo = req.tir_objetivo
 
@@ -322,6 +328,8 @@ def endpoint_analisis_completo(req: AnalisisCompletoRequest):
             porcentaje_capital_propio=req.porcentaje_capital_propio,
             velocidad_ventas_mensual=req.velocidad_ventas_mensual,
             mezcla_tipologias=mezcla,
+            # Las cocheras que exige la normativa se venden (antes se costeaba el sótano y no se vendían).
+            num_estacionamientos=cabida.estacionamientos_requeridos,
             calibracion=req.calibracion,
         ))
 
